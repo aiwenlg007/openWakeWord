@@ -1,96 +1,75 @@
-# Copyright 2022 David Scripka. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-# Imports
-import pyaudio
-import numpy as np
-from openwakeword.model import Model
 import argparse
+import numpy as np
+import pyaudio
+import time
+import openwakeword
+from openwakeword.model import Model
 
-# Parse input arguments
-parser=argparse.ArgumentParser()
-parser.add_argument(
-    "--chunk_size",
-    help="How much audio (in number of samples) to predict on at once",
-    type=int,
-    default=1280,
-    required=False
-)
-parser.add_argument(
-    "--model_path",
-    help="The path of a specific model to load",
-    type=str,
-    default="",
-    required=False
-)
-parser.add_argument(
-    "--inference_framework",
-    help="The inference framework to use (either 'onnx' or 'tflite'",
-    type=str,
-    default='tflite',
-    required=False
-)
+# ================== 配置区 ==================
+# 可选：第一次运行时自动下载预训练模型
+openwakeword.utils.download_models()
 
-args=parser.parse_args()
+# 支持的预训练唤醒词（你可以改成自己训练的 .onnx 文件）
+PRETRAINED_MODELS = ["alexa", "hey_mycroft", "hey_jarvis"]   # 常用几个
 
-# Get microphone stream
+# ============================================
+
+parser = argparse.ArgumentParser(description="openWakeWord 实时麦克风唤醒词检测（使用 ONNX）")
+parser.add_argument("--inference_framework", type=str, default="onnx",
+                    choices=["onnx", "tflite"], help="推理后端（Windows 推荐 onnx）")
+parser.add_argument("--model_path", type=str, default=None,
+                    help="自定义模型路径（.onnx 文件），留空则加载所有预训练模型")
+parser.add_argument("--threshold", type=float, default=0.5,
+                    help="检测阈值（0.0~1.0，越大越严格）")
+args = parser.parse_args()
+
+# ================== 加载模型 ==================
+if args.model_path:
+    print(f"加载自定义模型: {args.model_path}")
+    owwModel = Model(
+        wakeword_models=[args.model_path],
+        inference_framework=args.inference_framework
+    )
+else:
+    print("加载所有预训练模型（使用 ONNX）...")
+    owwModel = Model(
+        inference_framework=args.inference_framework,
+        # threshold=args.threshold   # 如果想全局设置阈值可以加
+    )
+
+print(f"✅ 成功加载 {len(owwModel.models)} 个唤醒词模型")
+
+# ================== 实时麦克风检测 ==================
+CHUNK = 1280          # openWakeWord 推荐的帧长
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 16000
-CHUNK = args.chunk_size
+
 audio = pyaudio.PyAudio()
-mic_stream = audio.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
+stream = audio.open(format=FORMAT, channels=CHANNELS,
+                    rate=RATE, input=True,
+                    frames_per_buffer=CHUNK)
 
-# Load pre-trained openwakeword models
-if args.model_path != "":
-    owwModel = Model(wakeword_models=[args.model_path], inference_framework=args.inference_framework)
-else:
-    owwModel = Model(inference_framework=args.inference_framework)
+print("\n🎤 正在监听麦克风... 说唤醒词试试！（按 Ctrl+C 退出）\n")
 
-n_models = len(owwModel.models.keys())
-
-# Run capture loop continuosly, checking for wakewords
-if __name__ == "__main__":
-    # Generate output string header
-    print("\n\n")
-    print("#"*100)
-    print("Listening for wakewords...")
-    print("#"*100)
-    print("\n"*(n_models*3))
-
+try:
     while True:
-        # Get audio
-        audio = np.frombuffer(mic_stream.read(CHUNK), dtype=np.int16)
+        data = stream.read(CHUNK, exception_on_overflow=False)
+        audio_frame = np.frombuffer(data, dtype=np.int16).astype(np.float32)
 
-        # Feed to openWakeWord model
-        prediction = owwModel.predict(audio)
+        # 预测
+        prediction = owwModel.predict(audio_frame)
 
-        # Column titles
-        n_spaces = 16
-        output_string_header = """
-            Model Name         | Score | Wakeword Status
-            --------------------------------------
-            """
+        # 显示检测结果
+        for wakeword, score in prediction.items():
+            if score >= args.threshold:
+                print(f"🚀 唤醒词触发！【{wakeword}】 分数: {score:.4f}   时间: {time.strftime('%H:%M:%S')}")
+            elif score > 0.1:   # 只显示有一定置信度的，减少输出
+                print(f"   {wakeword:15} → {score:.4f}")
 
-        for mdl in owwModel.prediction_buffer.keys():
-            # Add scores in formatted table
-            scores = list(owwModel.prediction_buffer[mdl])
-            curr_score = format(scores[-1], '.20f').replace("-", "")
-
-            output_string_header += f"""{mdl}{" "*(n_spaces - len(mdl))}   | {curr_score[0:5]} | {"--"+" "*20 if scores[-1] <= 0.5 else "Wakeword Detected!"}
-            """
-
-        # Print results table
-        print("\033[F"*(4*n_models+1))
-        print(output_string_header, "                             ", end='\r')
+except KeyboardInterrupt:
+    print("\n\n👋 检测已停止")
+finally:
+    stream.stop_stream()
+    stream.close()
+    audio.terminate()
